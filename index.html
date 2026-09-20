@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CodeGlean — recover files from web chats</title>
+  <meta name="description" content="CodeGlean recovers every file your web chats wrote: parses exported conversations, replays diffs into full files, and exports them as a .zip." />
+  <meta name="theme-color" content="#0F172A" />
+  <link rel="icon" type="image/svg+xml" href="icon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" />
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="bar-row bar-main">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">CodeGlean</span>
+      </div>
+      <div class="top-actions">
+        <label class="file-btn">
+          Choose JSON
+          <input type="file" id="fileInput" accept=".json,application/json" hidden />
+        </label>
+        <button id="downloadAll" class="ghost-btn" type="button" disabled title="Download the newest state of every reconstructed file as a .zip">Download all (.zip)</button>
+      </div>
+    </div>
+    <div class="bar-row bar-controls">
+      <div class="filters" id="viewToggle" role="group" aria-label="View">
+        <button data-view="timeline" class="active">Timeline</button>
+        <button data-view="diffs">Unapplied <span id="diffCount" class="view-count">0</span></button>
+      </div>
+      <div class="filters" id="senderFilters" role="group" aria-label="Filter by sender">
+        <button data-filter="all" class="active">All</button>
+        <button data-filter="human">Human</button>
+        <button data-filter="assistant">Assistant</button>
+      </div>
+      <input type="search" id="search" placeholder="Search messages…" autocomplete="off" />
+      <span id="matchCount" class="match-count"></span>
+      <span id="fileName" class="file-name">or drag &amp; drop a file anywhere</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" aria-label="Conversation summary">
+      <div class="side-card">
+        <div class="side-head">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span class="side-eyebrow">Session brief</span>
+        </div>
+        <h1 id="convTitle">CodeGlean</h1>
+        <div id="convMeta" class="stats">
+          <div class="stat-grid">
+            <div class="stat is-total"><div class="stat-v">—</div><div class="stat-k">Messages</div></div>
+            <div class="stat is-human"><div class="stat-v">—</div><div class="stat-k">Human</div></div>
+            <div class="stat is-assistant"><div class="stat-v">—</div><div class="stat-k">Assistant</div></div>
+          </div>
+        </div>
+        <button id="briefToggle" class="side-label brief-toggle" aria-expanded="false" aria-controls="convSummary"><span class="brief-twisty" aria-hidden="true">▸</span> Brief</button>
+        <p id="convSummary" class="summary collapsed" hidden></p>
+      </div>
+    </aside>
+
+    <div class="content">
+      <main id="timeline"></main>
+
+      <section id="diffSection" aria-label="Unapplied diffs" hidden></section>
+
+      <div id="emptyState" class="empty">
+        <p>Drop a <code>Conversation.json</code> export here, or use “Choose JSON”.</p>
+        <p class="hint">Messages render oldest → newest. Assistant shows <code>text</code> blocks only. Files written in a message appear beside it, downloadable — or grab the newest state of every file with “Download all”.</p>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="resolve.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
