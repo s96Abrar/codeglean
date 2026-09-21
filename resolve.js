@@ -477,14 +477,16 @@
     }
 
     var out = msgs.map(function (m) {
-      if (m.sender !== "assistant") return { uuid: m.uuid, display: m.raw, files: [] };
+      if (m.sender !== "assistant") return { uuid: m.uuid, display: m.raw, files: [], originalDiffs: [] };
       var events = tokenize(m.raw);
-      if (!events.length) return { uuid: m.uuid, display: m.raw, files: [] };
+      if (!events.length) return { uuid: m.uuid, display: m.raw, files: [], originalDiffs: [] };
 
       var repl = [];
       // Files written/updated by THIS message (latest snapshot wins on repeats).
       var msgFiles = [];
       var msgFileIdx = {};
+      // Raw diffs behind each applied hunk, in order (for per-file toggle).
+      var msgDiffs = [];
       function snapFile(canonPath, displayPath, info) {
         var entry = {
           path: canonPath,
@@ -559,6 +561,7 @@
         if (!st.lang) st.lang = inferLang(canon, "");
         var label = ev.displayPath || canon;
         snapFile(canon, label, { kind: "updated", added: res.added, removed: res.removed });
+        msgDiffs.push(ev.bodies.join("\n"));
         var tag = ev.path ? "" : " (file inferred)";
         var header = "**" + label + "** — full file (reconstructed from diff" + tag +
           " · rev " + st.revs + " · +" + res.added + "/-" + res.removed + ")";
@@ -569,7 +572,7 @@
         }
       });
 
-      if (!repl.length) return { uuid: m.uuid, display: m.raw, files: msgFiles };
+      if (!repl.length) return { uuid: m.uuid, display: m.raw, files: msgFiles, originalDiffs: msgDiffs };
       repl.sort(function (a, b) { return a.start - b.start; });
       var s = "";
       var pos = 0;
@@ -578,7 +581,7 @@
         pos = rp.end;
       });
       s += m.raw.slice(pos);
-      return { uuid: m.uuid, display: s, files: msgFiles };
+      return { uuid: m.uuid, display: s, files: msgFiles, originalDiffs: msgDiffs };
     });
 
     return { messages: out, states: states, stats: stats, failures: failures };

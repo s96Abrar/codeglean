@@ -76,6 +76,7 @@
           var r = byUuid.get(m.uuid);
           m.display = r ? r.display : m.raw;
           m.files = (r && r.files) || [];
+          m.originalDiffs = (r && r.originalDiffs) || [];
         });
         resolveStats = {
           files: Object.keys(resolved.states).length,
@@ -89,10 +90,10 @@
     var resolvedStates = (typeof resolved !== "undefined" && resolved && resolveStats)
       ? resolved.states : null;
     if (!resolvedStates) {
-      msgs.forEach(function (m) { m.display = m.raw; m.files = []; });
+      msgs.forEach(function (m) { m.display = m.raw; m.files = []; m.originalDiffs = []; });
     }
     if (!resolveStats) {
-      msgs.forEach(function (m) { m.display = m.raw; m.files = []; });
+      msgs.forEach(function (m) { m.display = m.raw; m.files = []; m.originalDiffs = []; });
     } else {
       resolvedStates = resolved.states;
     }
@@ -563,6 +564,7 @@
         }
       });
       decorateCodeBlocks(body);
+      attachDiffToggles(body, m.originalDiffs || []);
       frag.appendChild(card);
     });
 
@@ -611,6 +613,58 @@
     });
   });
   setView("timeline");
+
+  // Per-file Resolved/Original toggle on reconstructed blocks, matched to
+  // that message's original diffs in order. No-ops where counts differ.
+  function attachDiffToggles(scope, diffs) {
+    var di = 0;
+    Array.prototype.slice.call(scope.querySelectorAll(".codeblock")).forEach(function (wrap) {
+      if (!wrap.querySelector(".code-badge.ok")) return;
+      var entry = diffs[di++];
+      var pre = wrap.querySelector("pre");
+      var code = pre && pre.querySelector("code");
+      if (!entry || !pre || !code) return;
+      var head = wrap.querySelector(".code-head");
+      var langEl = head && head.querySelector(".code-lang");
+      var metaEl = head && head.querySelector(".code-meta");
+      var badgeEl = head && head.querySelector(".code-badge.ok");
+      var resolvedHTML = pre.innerHTML;
+      var savedLang = langEl && langEl.textContent;
+      var savedMeta = metaEl && metaEl.textContent;
+      var savedBadge = badgeEl && badgeEl.textContent;
+      var diffLines = entry.split("\n").length;
+      var showingResolved = true;
+      var btn = document.createElement("button");
+      btn.className = "code-toggle";
+      btn.type = "button";
+      btn.textContent = "Original";
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        showingResolved = !showingResolved;
+        if (showingResolved) {
+          pre.innerHTML = resolvedHTML;
+          btn.textContent = "Original";
+          if (badgeEl) badgeEl.textContent = savedBadge;
+          if (langEl) langEl.textContent = savedLang;
+          if (metaEl) metaEl.textContent = savedMeta;
+        } else {
+          var c = document.createElement("code");
+          c.className = "language-diff";
+          c.textContent = entry;
+          pre.textContent = "";
+          pre.appendChild(c);
+          if (window.hljs) {
+            try { window.hljs.highlightElement(c); } catch (err) { /* noop */ }
+          }
+          btn.textContent = "Resolved";
+          if (badgeEl) badgeEl.textContent = "original diff";
+          if (langEl) langEl.textContent = "diff";
+          if (metaEl) metaEl.textContent = diffLines + (diffLines === 1 ? " line" : " lines");
+        }
+      });
+      head.appendChild(btn);
+    });
+  }
 
   ["dragover", "dragenter"].forEach(function (evt) {
     window.addEventListener(evt, function (e) {
