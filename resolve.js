@@ -88,6 +88,15 @@
   }
 
   // Apply one diff body to current lines. Returns {ok, lines, added, removed}.
+  //
+  // "+" lines seen before the diff's first context/removed line have no
+  // anchor yet — buffer them (leadingAdds) instead of writing them at
+  // whatever the cursor happens to be (line 0), otherwise a diff that opens
+  // with pure additions (e.g. a new function inserted before some later
+  // context line) gets dumped at the very top of the file. Once the first
+  // anchor resolves via findLine, the buffered adds are flushed immediately
+  // before it — which also reproduces a genuine top-of-file insert correctly,
+  // since an anchor found at index 0 makes the unchanged prefix empty anyway.
   function applyOne(current, diffLines, loose) {
     var out = [];
     var i = 0;
@@ -95,31 +104,40 @@
     var removed = 0;
     var matched = 0;
     var k, j;
+    var leadingAdds = [];
+    var anchored = false;
+    function flushPrefix(uptoIndex) {
+      for (var p = i; p < uptoIndex; p++) out.push(current[p]);
+      for (var q = 0; q < leadingAdds.length; q++) out.push(leadingAdds[q]);
+      leadingAdds = [];
+      anchored = true;
+    }
     for (var n = 0; n < diffLines.length; n++) {
       var d = diffLines[n];
       var op = d.charAt(0);
       var core = (op === "+" || op === "-" || op === " ") ? d.slice(1) : d;
       if (isEllipsis(core)) continue; // "..." omission marker: matches anything
       if (op === "+") {
-        out.push(d.slice(1));
+        if (anchored) out.push(d.slice(1));
+        else leadingAdds.push(d.slice(1));
         added++;
       } else if (op === "-") {
         k = findLine(current, i, d.slice(1), loose);
         if (k === -1) return { ok: false, reason: "removed line not found: " + JSON.stringify(d.slice(1).slice(0, 80)) };
-        for (j = i; j < k; j++) out.push(current[j]);
+        flushPrefix(k);
         i = k + 1;
         removed++;
       } else if (op === " ") {
         k = findLine(current, i, d.slice(1), loose);
         if (k === -1) return { ok: false, reason: "context line not found: " + JSON.stringify(d.slice(1).slice(0, 80)) };
-        for (j = i; j < k; j++) out.push(current[j]);
+        flushPrefix(k);
         out.push(current[k]);
         i = k + 1;
         matched++;
       } else if (d === "") {
         k = findLine(current, i, "", loose);
         if (k === -1) return { ok: false, reason: "blank context line not found" };
-        for (j = i; j < k; j++) out.push(current[j]);
+        flushPrefix(k);
         out.push(current[k]);
         i = k + 1;
         matched++;
@@ -127,6 +145,7 @@
         return { ok: false, reason: "unexpected diff line prefix: " + JSON.stringify(d.slice(0, 40)) };
       }
     }
+    for (j = 0; j < leadingAdds.length; j++) out.push(leadingAdds[j]);
     for (j = i; j < current.length; j++) out.push(current[j]);
     return { ok: true, lines: out, added: added, removed: removed, matched: matched };
   }
@@ -163,11 +182,13 @@
     return hits;
   }
 
-  // Split a diff into independent change runs. Each run = leading context +
-  // interleaved -/+ ops + trailing context. Context is shared across the gap
-  // between adjacent runs (both sides verify against the same region; only
-  // leading+dels are consumed by a splice, so sharing is safe).
-  function parseRuns(diffLines) {
+  // Split a diff into change runs. Each run = leading context + interleaved
+  // -/+ ops + trailing context. When split is false, the whole diff stays one
+  // run (matches when every edit sits at a single contiguous site). When
+  // split is true, a context gap that follows at least one op closes the run
+  // and seeds the next one (independent edit clusters, possibly out of file
+  // order) — that context is shared as both trailing and the next leading.
+  function parseRuns(diffLines, split) {
     var runs = [];
     var pending = [];
     var cur = null;
@@ -179,7 +200,10 @@
       if (isEllipsis(core)) continue;
       if (d === "") { op = " "; core = ""; }
       if (op === "+" || op === "-") {
-        if (!cur) {
+        if (split && cur && cur.trailing.length) {
+          runs.push({ leading: cur.leading, ops: cur.ops, trailing: cur.trailing.slice(0, 30) });
+          cur = { leading: cur.trailing.slice(-30), ops: [], trailing: [] };
+        } else if (!cur) {
           cur = { leading: pending.slice(-30), ops: [], trailing: [] };
           pending = [];
         }
@@ -196,12 +220,8 @@
     if (cur) {
       // Trailing ctx that runs to EOF belongs to the last run; cap it.
       cur.trailing = cur.trailing.slice(0, 30);
-      // The gap ctx before each run doubles as the previous run's trailing.
-      // Re-split: run[i].trailing should only extend to the next run's start.
       runs.push(cur);
     }
-    // Fix up sharing: trailing of run[i] overlaps leading of run[i+1] by
-    // construction (both draw from the same gap buffer) — nothing to do.
     if (!anchored) return null; // pure-add hunk: position unknowable
     return runs;
   }
@@ -227,11 +247,23 @@
   // Independent-run application: each change cluster is anchored and spliced
   // on its own, so hunks whose clusters appear in a different order than the
   // file (or drifted filed order) still resolve. All-or-nothing per event.
+  // Tries the whole diff as one contiguous run first (works when everything
+  // sits at a single site), then falls back to splitting on context gaps for
+  // diffs that bundle several independent, possibly out-of-order edits.
   function applyRuns(current, diffLines) {
-    var runs = parseRuns(diffLines);
+    var whole = parseRuns(diffLines, false);
+    if (whole && whole.length) {
+      var r1 = applyRunsWith(current, whole);
+      if (r1.ok) return r1;
+    }
+    var runs = parseRuns(diffLines, true);
     if (!runs || !runs.length) {
       return { ok: false, reason: "hunk has no anchor lines or bad prefix" };
     }
+    return applyRunsWith(current, runs);
+  }
+
+  function applyRunsWith(current, runs) {
     var lines = current.slice();
     var added = 0;
     var removed = 0;
