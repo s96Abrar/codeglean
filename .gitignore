@@ -1,3 +1,7 @@
+# Real conversation exports (private data; the app auto-loads these locally)
+Conversation.json
+conversation.json
+
 # Logs
 logs
 *.log

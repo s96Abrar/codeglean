@@ -70,10 +70,10 @@
     try {
       if (window.ConversationResolve) {
         var resolved = window.ConversationResolve.resolveAll(msgs);
-        var byUuid = {};
-        resolved.messages.forEach(function (r) { byUuid[r.uuid] = r; });
+        var byUuid = new Map();
+        resolved.messages.forEach(function (r) { byUuid.set(r.uuid, r); });
         msgs.forEach(function (m) {
-          var r = byUuid[m.uuid];
+          var r = byUuid.get(m.uuid);
           m.display = r ? r.display : m.raw;
           m.files = (r && r.files) || [];
         });
@@ -197,11 +197,14 @@
   }
 
   function renderMarkdown(raw) {
-    if (window.marked) return window.marked.parse(raw);
-    // Offline fallback: escape + wrap in <pre>.
-    var div = document.createElement("div");
-    div.textContent = raw;
-    return "<pre>" + div.innerHTML + "</pre>";
+    // ponytail: sanitize-or-nothing; raw innerHTML lets a hostile export run JS.
+    if (!window.marked || !window.DOMPurify) {
+      // Offline fallback: escape + wrap in <pre>.
+      var div = document.createElement("div");
+      div.textContent = raw;
+      return "<pre>" + div.innerHTML + "</pre>";
+    }
+    return window.DOMPurify.sanitize(window.marked.parse(raw));
   }
 
   // All code blocks start collapsed; expand per block from the header.
@@ -624,6 +627,12 @@
       document.body.classList.remove("dragover");
     });
   });
+
+  if (!window.marked || !window.DOMPurify || !window.hljs || !window.JSZip) {
+    console.warn("[CodeGlean] a vendor script failed to load; rendering degraded:",
+      "marked=" + !!window.marked, "DOMPurify=" + !!window.DOMPurify,
+      "hljs=" + !!window.hljs, "JSZip=" + !!window.JSZip);
+  }
 
   // Auto-load a sibling export from the current directory when served over
   // http(s). Tries both casings (Conversation.json / conversation.json),
