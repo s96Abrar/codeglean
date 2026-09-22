@@ -3,14 +3,25 @@
  * just lines prefixed with ' ' (context), '+' (added), '-' (removed).
  *
  * Strategy: walk messages oldest -> newest, track per-file line state seeded by
- * full-file blocks, and apply each diff with a forward-searching cursor so both
- * full-file diffs and partial hunks resolve to the complete new file.
+ * full-file blocks. Each diff is split into independent edit clusters, every
+ * cluster's position is independently verified against the current file (never
+ * guessed), then serialized into a real unified-diff patch and applied via the
+ * vendored jsdiff engine (vendor/diff.min.js) — see buildHunk/buildPatchText.
  *
  * Browser: <script src="resolve.js"> exposes window.ConversationResolve.
  * Node: require('./resolve.js').
  */
 (function (root) {
   "use strict";
+
+  var diffEngine = null;
+  function patchEngine() {
+    if (diffEngine) return diffEngine;
+    diffEngine = (typeof window !== "undefined" && window.Diff) ? window.Diff
+      : (typeof require === "function" ? require("./vendor/diff.min.js") : null);
+    if (!diffEngine) throw new Error("jsdiff (vendor/diff.min.js) is not loaded");
+    return diffEngine;
+  }
 
   // Optional **path** header (with optional (note) and/or — note) immediately
   // followed by a fenced code block. Bare fences match too (header undefined).
@@ -62,100 +73,12 @@
     return t === "..." || t === "…";
   }
 
-  function findLine(lines, from, target, loose) {
-    var i, cand, t;
-    var abbr = target.indexOf("(...)");
-    if (abbr !== -1) {
-      // Abbreviated context ("LanguageGrammar(...)"): prefix match.
-      var prefix = loose ? target.slice(0, abbr).replace(/\s+$/g, "") : target.slice(0, abbr);
-      for (i = from; i < lines.length; i++) {
-        cand = loose ? lines[i].replace(/\s+$/g, "") : lines[i];
-        if (cand.slice(0, prefix.length) === prefix) return i;
-      }
-      return -1;
-    }
-    if (!loose) {
-      for (i = from; i < lines.length; i++) {
-        if (lines[i] === target) return i;
-      }
-      return -1;
-    }
-    t = target.replace(/\s+$/g, "");
-    for (i = from; i < lines.length; i++) {
-      if (lines[i].replace(/\s+$/g, "") === t) return i;
-    }
-    return -1;
-  }
-
-  // Apply one diff body to current lines. Returns {ok, lines, added, removed}.
-  //
-  // "+" lines seen before the diff's first context/removed line have no
-  // anchor yet — buffer them (leadingAdds) instead of writing them at
-  // whatever the cursor happens to be (line 0), otherwise a diff that opens
-  // with pure additions (e.g. a new function inserted before some later
-  // context line) gets dumped at the very top of the file. Once the first
-  // anchor resolves via findLine, the buffered adds are flushed immediately
-  // before it — which also reproduces a genuine top-of-file insert correctly,
-  // since an anchor found at index 0 makes the unchanged prefix empty anyway.
-  function applyOne(current, diffLines, loose) {
-    var out = [];
-    var i = 0;
-    var added = 0;
-    var removed = 0;
-    var matched = 0;
-    var k, j;
-    var leadingAdds = [];
-    var anchored = false;
-    function flushPrefix(uptoIndex) {
-      for (var p = i; p < uptoIndex; p++) out.push(current[p]);
-      for (var q = 0; q < leadingAdds.length; q++) out.push(leadingAdds[q]);
-      leadingAdds = [];
-      anchored = true;
-    }
-    for (var n = 0; n < diffLines.length; n++) {
-      var d = diffLines[n];
-      var op = d.charAt(0);
-      var core = (op === "+" || op === "-" || op === " ") ? d.slice(1) : d;
-      if (isEllipsis(core)) continue; // "..." omission marker: matches anything
-      if (op === "+") {
-        if (anchored) out.push(d.slice(1));
-        else leadingAdds.push(d.slice(1));
-        added++;
-      } else if (op === "-") {
-        k = findLine(current, i, d.slice(1), loose);
-        if (k === -1) return { ok: false, reason: "removed line not found: " + JSON.stringify(d.slice(1).slice(0, 80)) };
-        flushPrefix(k);
-        i = k + 1;
-        removed++;
-      } else if (op === " ") {
-        k = findLine(current, i, d.slice(1), loose);
-        if (k === -1) return { ok: false, reason: "context line not found: " + JSON.stringify(d.slice(1).slice(0, 80)) };
-        flushPrefix(k);
-        out.push(current[k]);
-        i = k + 1;
-        matched++;
-      } else if (d === "") {
-        k = findLine(current, i, "", loose);
-        if (k === -1) return { ok: false, reason: "blank context line not found" };
-        flushPrefix(k);
-        out.push(current[k]);
-        i = k + 1;
-        matched++;
-      } else {
-        return { ok: false, reason: "unexpected diff line prefix: " + JSON.stringify(d.slice(0, 40)) };
-      }
-    }
-    for (j = 0; j < leadingAdds.length; j++) out.push(leadingAdds[j]);
-    for (j = i; j < current.length; j++) out.push(current[j]);
-    return { ok: true, lines: out, added: added, removed: removed, matched: matched };
-  }
-
   function trimBoth(s) {
     return String(s).replace(/^\s+|\s+$/g, "");
   }
 
-  // Lenient anchor comparison for the run-based fallback: ignores surrounding
-  // whitespace and treats "(...)" as an LLM abbreviation of a longer line.
+  // Lenient anchor comparison: ignores surrounding whitespace and treats
+  // "(...)" as an LLM abbreviation of a longer line.
   function anchorEq(fileLine, target) {
     var ab = target.indexOf("(...)");
     if (ab !== -1) {
@@ -165,31 +88,16 @@
     return trimBoth(fileLine) === trimBoth(target);
   }
 
-  function contigAt(lines, from, seq) {
-    if (from < 0 || from + seq.length > lines.length) return false;
-    for (var k = 0; k < seq.length; k++) {
-      if (!anchorEq(lines[from + k], seq[k])) return false;
-    }
-    return true;
-  }
-
-  function locateSeq(lines, seq) {
-    var hits = [];
-    if (!seq.length) return hits;
-    for (var i = 0; i + seq.length <= lines.length; i++) {
-      if (contigAt(lines, i, seq)) hits.push(i);
-    }
-    return hits;
-  }
-
-  // Split a diff into change runs. Each run = leading context + interleaved
-  // -/+ ops + trailing context. When split is false, the whole diff stays one
-  // run (matches when every edit sits at a single contiguous site). When
-  // split is true, a context gap that follows at least one op closes the run
-  // and seeds the next one (independent edit clusters, possibly out of file
-  // order) — that context is shared as both trailing and the next leading.
-  function parseRuns(diffLines, split) {
-    var runs = [];
+  // Split a flat diff into independent edit clusters. Each cluster = leading
+  // context + interleaved -/+ ops + trailing context. A cluster boundary is
+  // forced (a) whenever context follows at least one op and more ops appear
+  // after (a fresh edit site restated with its own context), and (b) at an
+  // "..." omission marker, which explicitly disclaims contiguity. Clusters
+  // are anchored and expanded independently (see buildHunk), so edits that
+  // appear out of file order, or with large stretches of unlisted unchanged
+  // lines between them, still resolve correctly.
+  function splitClusters(diffLines) {
+    var clusters = [];
     var pending = [];
     var cur = null;
     var anchored = false;
@@ -197,11 +105,15 @@
       var d = diffLines[n];
       var op = d.charAt(0);
       var core = (op === "+" || op === "-" || op === " ") ? d.slice(1) : d;
-      if (isEllipsis(core)) continue;
+      if (isEllipsis(core)) {
+        if (cur) { clusters.push(cur); cur = null; }
+        pending = [];
+        continue;
+      }
       if (d === "") { op = " "; core = ""; }
       if (op === "+" || op === "-") {
-        if (split && cur && cur.trailing.length) {
-          runs.push({ leading: cur.leading, ops: cur.ops, trailing: cur.trailing.slice(0, 30) });
+        if (cur && cur.trailing.length) {
+          clusters.push(cur);
           cur = { leading: cur.trailing.slice(-30), ops: [], trailing: [] };
         } else if (!cur) {
           cur = { leading: pending.slice(-30), ops: [], trailing: [] };
@@ -217,135 +129,207 @@
         return null; // unexpected prefix: not a parseable hunk
       }
     }
-    if (cur) {
-      // Trailing ctx that runs to EOF belongs to the last run; cap it.
-      cur.trailing = cur.trailing.slice(0, 30);
-      runs.push(cur);
-    }
+    if (cur) clusters.push(cur);
     if (!anchored) return null; // pure-add hunk: position unknowable
-    return runs;
+    return clusters;
   }
 
-  // Apply one run at a specific site. Returns {ok, seg, end} where seg
-  // replaces lines[loc..end).
-  function applyRunAt(lines, loc, run, skipTrailing) {
-    var leadLen = run.leading.length;
-    var i = loc + leadLen;
-    var seg = lines.slice(loc, loc + leadLen);
-    var added = 0;
-    var removed = 0;
-    for (var n = 0; n < run.ops.length; n++) {
-      var o = run.ops[n];
-      if (o.op === "+") { seg.push(o.line); added++; }
-      else if (i < lines.length && anchorEq(lines[i], o.line)) { i++; removed++; }
-      else return { ok: false };
+  // Forward search tolerant of unlisted gaps: the pseudo-diff format has no
+  // line numbers, so most real diffs only restate a line or two of context
+  // near each edit and leave everything else out (observed empirically:
+  // ~94% of diffs in a real conversation skip at least one unlisted line,
+  // sometimes 100+). buildHunk backfills whatever this finds as ordinary
+  // unchanged context so the emitted hunk stays a valid, contiguous slice.
+  function findForward(lines, from, target) {
+    for (var i = from; i < lines.length; i++) {
+      if (anchorEq(lines[i], target)) return i;
     }
-    if (!skipTrailing && !contigAt(lines, i, run.trailing)) return { ok: false };
-    return { ok: true, seg: seg, end: i, added: added, removed: removed };
+    return -1;
   }
 
-  // Independent-run application: each change cluster is anchored and spliced
-  // on its own, so hunks whose clusters appear in a different order than the
-  // file (or drifted filed order) still resolve. All-or-nothing per event.
-  // Tries the whole diff as one contiguous run first (works when everything
-  // sits at a single site), then falls back to splitting on context gaps for
-  // diffs that bundle several independent, possibly out-of-order edits.
-  function applyRuns(current, diffLines) {
-    var whole = parseRuns(diffLines, false);
-    if (whole && whole.length) {
-      var r1 = applyRunsWith(current, whole);
-      if (r1.ok) return r1;
-    }
-    var runs = parseRuns(diffLines, true);
-    if (!runs || !runs.length) {
-      return { ok: false, reason: "hunk has no anchor lines or bad prefix" };
-    }
-    return applyRunsWith(current, runs);
-  }
+  // Walk one cluster's items forward from a specific candidate start
+  // position — applyOne's proven cursor-walk algorithm, parameterized on
+  // where it starts instead of always starting at 0, and backfilling
+  // unlisted gaps as ordinary context (see findForward) along the way.
+  //
+  // trailingFrom: index in `items` where pure trailing context begins (after
+  // all ops). Nothing is being edited there — it exists only to help confirm
+  // position — so if it can't be found going forward (e.g. it's actually
+  // restating earlier-in-file content, as diffs in this format sometimes do
+  // right after a pure-add edit), the walk is simply truncated there instead
+  // of failing outright. Leading context and ops are never truncated: they
+  // represent the edit itself and must genuinely resolve.
+  //
+  // Returns {ok, oldStart, oldEnd, trailingStart, dels: {oldIndex: true},
+  // adds: {oldIndex: [lines inserted immediately before oldIndex]}, added,
+  // removed} — an interval [oldStart, oldEnd) of `current` plus sparse edits
+  // within it, rather than a flat line-by-line body. This shape is what
+  // makes merging two overlapping/nested hunks (see buildPatchText) a plain
+  // interval and map union instead of fragile array splicing. trailingStart
+  // is the position where trailing context begins (== oldEnd if there is
+  // none): the next cluster's leading is always this same trailing content,
+  // so buildPatchText uses it to try that cluster's anchor directly there
+  // first, before falling back to a full-file search.
+  function walkClusterFrom(current, items, anchorIdx, startAt, trailingFrom) {
+    var dels = {}, adds = {};
+    var added = 0, removed = 0;
+    var cursor = startAt;
+    var leadingAdds = [];
+    var trailingStart = null;
+    function addAt(pos, line) { (adds[pos] || (adds[pos] = [])).push(line); added++; }
 
-  function applyRunsWith(current, runs) {
-    var lines = current.slice();
-    var added = 0;
-    var removed = 0;
-    for (var r = 0; r < runs.length; r++) {
-      var run = runs[r];
-      var cands;
-      var insertBefore = false;
-      if (run.leading.length) {
-        cands = locateSeq(lines, run.leading);
-      } else if (run.ops.length && run.ops[0].op === "-") {
-        // No leading context: anchor on the first removed line.
-        cands = [];
-        for (var i = 0; i < lines.length; i++) {
-          if (anchorEq(lines[i], run.ops[0].line)) cands.push(i);
-        }
-        // Reframe: pretend the del line is leading (it will be re-walked).
-        if (cands.length) {
-          run = { leading: [run.ops[0].line], ops: run.ops.slice(1), trailing: run.trailing };
-        }
-      } else {
-        // Pure-add run: insert before trailing anchor.
-        cands = locateSeq(lines, run.trailing);
-        insertBefore = true;
-      }
-      if (!cands.length) return { ok: false, reason: "run " + r + " anchor not found" };
-      var done = null;
-      if (insertBefore) {
-        if (cands.length !== 1) return { ok: false, reason: "run " + r + " add-only hunk anchor ambiguous" };
-        var at = cands[0];
-        var ins = [];
-        for (var q = 0; q < run.ops.length; q++) {
-          if (run.ops[q].op !== "+") return { ok: false, reason: "unexpected del in add-only run" };
-          ins.push(run.ops[q].line);
-          added++;
-        }
-        lines = lines.slice(0, at).concat(ins, lines.slice(at));
+    for (var n = 0; n < items.length; n++) {
+      if (n === trailingFrom) trailingStart = cursor;
+      var it = items[n];
+      if (it.op === "+") {
+        if (n < anchorIdx) leadingAdds.push(it.line);
+        else addAt(cursor, it.line);
         continue;
       }
-      // Phase A: full verify including trailing; exactly one site may verify.
-      var verified = [];
-      for (var c = 0; c < cands.length; c++) {
-        var res = applyRunAt(lines, cands[c], run, false);
-        if (res.ok) verified.push({ cand: cands[c], res: res });
+      var k = (n === anchorIdx) ? startAt : findForward(current, cursor, it.line);
+      if (k === -1) {
+        if (n >= trailingFrom) break; // drop unverifiable trailing, keep what's confirmed
+        return { ok: false };
       }
-      if (verified.length === 1) { done = verified[0]; }
-      else if (verified.length > 1) {
-        return { ok: false, reason: "run " + r + " anchor ambiguous" };
-      } else if (cands.length === 1) {
-        // Phase B: trailing mismatch tolerated only at a unique site.
-        var rb = applyRunAt(lines, cands[0], run, true);
-        if (rb.ok) done = { cand: cands[0], res: rb };
-      }
-      if (!done) return { ok: false, reason: "run " + r + " of " + runs.length + " does not verify" };
-      lines = lines.slice(0, done.cand).concat(done.res.seg, lines.slice(done.res.end));
-      added += done.res.added;
-      removed += done.res.removed;
+      if (n === anchorIdx) { for (var la = 0; la < leadingAdds.length; la++) addAt(startAt, leadingAdds[la]); }
+      if (it.op === "-") { dels[k] = true; removed++; }
+      cursor = k + 1;
     }
-    return { ok: true, lines: lines, added: added, removed: removed, matched: 0 };
+    if (trailingStart === null) trailingStart = cursor;
+    return { ok: true, oldStart: startAt, oldEnd: cursor, trailingStart: trailingStart, dels: dels, adds: adds, added: added, removed: removed };
+  }
+
+  // cursorHint: where the previous cluster in this same diff left off. Most
+  // clusters are the next sequential edit in the same narrative, so their
+  // anchor — even a generic one like a lone "}" — is simply the next line
+  // after the previous edit; trying that position first (and using it
+  // whenever it actually matches) reproduces applyOne's single-cursor
+  // behavior for the common case. Only when continuation doesn't hold (a
+  // genuinely out-of-order/scattered cluster) does this fall back to
+  // searching the whole file and disambiguating among candidates.
+  function buildHunk(current, cluster, cursorHint) {
+    // Reconstruct this cluster's own flat item sequence (leading context,
+    // interleaved ops, trailing context) in original diff order.
+    var items = [];
+    cluster.leading.forEach(function (l) { items.push({ op: " ", line: l }); });
+    cluster.ops.forEach(function (o) { items.push(o); });
+    cluster.trailing.forEach(function (l) { items.push({ op: " ", line: l }); });
+
+    var anchorIdx = -1;
+    for (var a = 0; a < items.length; a++) {
+      if (items[a].op !== "+") { anchorIdx = a; break; }
+    }
+    if (anchorIdx === -1) return { ok: false, reason: "add-only hunk has no anchor" };
+    var trailingFrom = cluster.leading.length + cluster.ops.length;
+
+    if (cursorHint != null && anchorEq(current[cursorHint], items[anchorIdx].line)) {
+      var direct = walkClusterFrom(current, items, anchorIdx, cursorHint, trailingFrom);
+      if (direct.ok) return direct;
+    }
+
+    // The anchor LINE alone (e.g. a lone "}" or a blank line) is often not
+    // globally unique. Try every occurrence as a candidate start and walk
+    // the whole cluster forward from each (with gap backfill). Because
+    // findForward searches with no upper bound, a candidate that starts too
+    // early will often still "succeed" — it just backfills a lot of
+    // unrelated content on its way to the same unique content a correctly-
+    // placed candidate would reach directly. So a bare "did it succeed" test
+    // doesn't disambiguate; the candidate that needed to backfill the LEAST
+    // (smallest span) is the one actually anchored at the edit, and is
+    // required to be the unique minimum — a tie means the cluster's content
+    // is genuinely ambiguous and must fail loud rather than guess.
+    var successes = [];
+    for (var i = 0; i < current.length; i++) {
+      if (!anchorEq(current[i], items[anchorIdx].line)) continue;
+      var r = walkClusterFrom(current, items, anchorIdx, i, trailingFrom);
+      if (r.ok) successes.push(r);
+    }
+    if (successes.length === 0) return { ok: false, reason: "anchor not found" };
+    var minSpan = Math.min.apply(null, successes.map(function (s) { return s.oldEnd - s.oldStart; }));
+    var best = successes.filter(function (s) { return (s.oldEnd - s.oldStart) === minSpan; });
+    if (best.length > 1) return { ok: false, reason: "anchor ambiguous" };
+    return best[0];
+  }
+
+  // Build a real unified-diff patch text from a flat pseudo-diff, with every
+  // hunk's position independently verified against `current` (never guessed,
+  // never left to the patch engine's own search — see buildHunk).
+  function buildPatchText(current, diffLines) {
+    var clusters = splitClusters(diffLines);
+    if (!clusters || !clusters.length) {
+      return { ok: false, reason: "hunk has no anchor lines or bad prefix" };
+    }
+    var hunks = [];
+    var cursorHint = null;
+    for (var c = 0; c < clusters.length; c++) {
+      var h = buildHunk(current, clusters[c], cursorHint);
+      if (!h.ok) return { ok: false, reason: "cluster " + c + " of " + clusters.length + ": " + h.reason };
+      hunks.push(h);
+      cursorHint = h.trailingStart;
+    }
+    // Overlapping ranges are expected, not just at cluster boundaries: a
+    // cluster's trailing context can run for a while (see the trailing-
+    // truncation note above) and legitimately swallow another cluster's
+    // whole span, including when that other cluster's real file position
+    // comes earlier than this one's despite appearing first in the diff.
+    // None of that is a conflict as long as every position in the overlap
+    // agrees on whether it's touched — merge by unioning the [oldStart,
+    // oldEnd) intervals and their sparse dels/adds maps; a real conflict
+    // (two clusters editing the very same line differently) still fails
+    // loudly rather than guessing.
+    hunks.sort(function (a, b) { return a.oldStart - b.oldStart; });
+    var merged = [];
+    for (var i = 0; i < hunks.length; i++) {
+      var h = hunks[i];
+      var last = merged[merged.length - 1];
+      if (last && h.oldStart <= last.oldEnd) {
+        for (var pos in h.dels) { last.dels[pos] = true; }
+        for (var apos in h.adds) {
+          last.adds[apos] = (last.adds[apos] || []).concat(h.adds[apos]);
+        }
+        last.oldEnd = Math.max(last.oldEnd, h.oldEnd);
+        last.added += h.added;
+        last.removed += h.removed;
+      } else {
+        merged.push({ oldStart: h.oldStart, oldEnd: h.oldEnd, dels: Object.assign({}, h.dels), adds: Object.assign({}, h.adds), added: h.added, removed: h.removed });
+      }
+    }
+    hunks = merged;
+    var text = "--- a\n+++ b\n";
+    var delta = 0, added = 0, removed = 0;
+    hunks.forEach(function (h) {
+      var newStart = h.oldStart + delta;
+      var lines = [];
+      var oldCount = 0, newCount = 0;
+      for (var p = h.oldStart; p <= h.oldEnd; p++) {
+        (h.adds[p] || []).forEach(function (l) { lines.push("+" + l); newCount++; });
+        if (p === h.oldEnd) break;
+        if (h.dels[p]) { lines.push("-" + current[p]); oldCount++; }
+        else { lines.push(" " + current[p]); oldCount++; newCount++; }
+      }
+      text += "@@ -" + (h.oldStart + 1) + "," + oldCount + " +" + (newStart + 1) + "," + newCount + " @@\n";
+      text += lines.join("\n") + "\n";
+      delta += newCount - oldCount;
+      added += h.added;
+      removed += h.removed;
+    });
+    return { ok: true, text: text, added: added, removed: removed };
   }
 
   function applyDiff(current, bodies) {
     var diffLines = bodies.join("\n").split("\n");
     while (diffLines.length && diffLines[0] === "") diffLines.shift();
     while (diffLines.length && diffLines[diffLines.length - 1] === "") diffLines.pop();
-    // A hunk of pure additions has no position info — never "succeed" by
-    // prepending it; only the anchored run path may place it (and it fails).
-    var anchored = diffLines.some(function (d) {
-      var op = d.charAt(0);
-      if (op !== " " && op !== "-") return false;
-      var core = d.slice(1);
-      return !isEllipsis(core);
-    });
-    var r;
-    if (anchored) {
-      r = applyOne(current, diffLines, false);
-      if (r.ok) { r.method = "stream"; return r; }
-      r = applyOne(current, diffLines, true);
-      if (r.ok) { r.method = "stream-loose"; return r; }
+    var patch = buildPatchText(current, diffLines);
+    if (!patch.ok) return patch;
+    var result;
+    try {
+      result = patchEngine().applyPatch(current.join("\n"), patch.text, { fuzzFactor: 0 });
+    } catch (e) {
+      return { ok: false, reason: "patch engine rejected a pre-verified hunk: " + e.message };
     }
-    r = applyRuns(current, diffLines);
-    if (r.ok) { r.method = "runs"; return r; }
-    return r;
+    if (result === false) return { ok: false, reason: "patch engine rejected a pre-verified hunk" };
+    return { ok: true, lines: result.split("\n"), added: patch.added, removed: patch.removed, method: "patch" };
   }
 
   function basename(p) {
@@ -490,8 +474,7 @@
     var byBase = {}; // basename -> [canonical paths]
     var stats = {
       totalEvents: 0, fullEvents: 0, diffEvents: 0,
-      diffApplied: 0, diffFailed: 0, inferredApplied: 0, pairedEvents: 0,
-      byMethod: { stream: 0, "stream-loose": 0, runs: 0 }
+      diffApplied: 0, diffFailed: 0, inferredApplied: 0, pairedEvents: 0
     };
     var failures = [];
 
@@ -585,7 +568,6 @@
           return;
         }
         stats.diffApplied++;
-        if (res.method && stats.byMethod[res.method] !== undefined) stats.byMethod[res.method]++;
         var st = states[canon];
         st.lines = res.lines;
         st.revs++;

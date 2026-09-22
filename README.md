@@ -21,7 +21,7 @@ CodeGlean fixes that: drop in the exported `Conversation.json` and it replays ev
 ## How it works
 
 1. **Parse** — the export becomes a two-column timeline: session brief with live stats on the left, every human/assistant message oldest-first on the right.
-2. **Replay** — code fences tagged `**path/to/file** (new)` seed a file; `(diff)` fences are applied forward through history (streaming, whitespace-tolerant, and anchor-based strategies), so each message shows the full file *as it existed at that point*.
+2. **Replay** — code fences tagged `**path/to/file** (new)` seed a file; `(diff)` fences are converted into real unified-diff patches (each edit independently anchored against the current file, never guessed) and applied via a vendored patch engine, so each message shows the full file *as it existed at that point*.
 3. **Recover** — download any single file beside its message, open the **Unapplied diffs** section to review hunks that couldn't be reconstructed (with reasons, oldest-first), or export the newest state of all files as a `.zip`.
 
 ## Highlights

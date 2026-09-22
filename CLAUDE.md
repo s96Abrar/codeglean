@@ -22,23 +22,24 @@ Note: opening `index.html` directly via `file://` will NOT auto-load conversatio
 
 ## Architecture
 
-Three plain scripts, loaded in order in `index.html`: `resolve.js` → `app.js` (plus vendored libs in `vendor/`: `marked`, `DOMPurify`, `highlight.js`, `JSZip`).
+Four plain scripts, loaded in order in `index.html`: `diff.min.js` (jsdiff, vendored) → `resolve.js` → `app.js` (plus other vendored libs in `vendor/`: `marked`, `DOMPurify`, `highlight.js`, `JSZip`).
 
 ### `resolve.js` — diff replay engine (`window.ConversationResolve`)
 
-This is the core/hard part of the app. It reconstructs full files from a custom, non-git diff format found in these conversation exports: no headers, no `@@` hunks, just lines prefixed with `' '` (context), `'+'` (added), `'-'` (removed), inside fences tagged like `**path/to/file** (new)` or `**path/to/file** (diff)`.
+This is the core/hard part of the app. It reconstructs full files from a custom, non-git diff format found in these conversation exports: no headers, no `@@` hunks, just lines prefixed with `' '` (context), `'+'` (added), `'-'` (removed), inside fences tagged like `**path/to/file** (new)` or `**path/to/file** (diff)`. It has no line numbers and frequently omits large stretches of unlisted unchanged lines between edits with no marker at all — real diffs in this format restate only a line or two of context near each edit, not full surrounding context.
 
 Flow, in order:
 1. **`tokenize(raw)`** — scans one assistant message's markdown for path-headed code fences and classifies each as `full` (whole file) or `diff` (hunk to apply). Handles edge cases: headerless diff fences that continue a preceding diff for the same file, headers separated from their fence by prose (paired via a second pass), and "lives at `path`" prose hints for orphaned full-file fences (third pass).
 2. **`resolveAll(msgs)`** — walks all messages oldest→newest, maintaining a `states` map of `path -> {lines, lang, revs}`. For each `full` event it seeds/replaces file state directly. For each `diff` event it calls `applyDiff`.
-3. **`applyDiff(current, bodies)`** tries three strategies in order, falling back on failure:
-   - `applyOne` (strict): walk the diff top-to-bottom, matching context/removed lines exactly via `findLine`.
-   - `applyOne` (loose): same, but whitespace-tolerant matching.
-   - `applyRuns`: splits the diff into independent change "runs" (each anchored by surrounding context) and locates/applies each run independently via `locateSeq`/`applyRunAt`. This handles hunks whose clusters don't appear in file order, or drifted diffs, at the cost of requiring unambiguous anchors.
-4. Diffs that still fail to apply are recorded in `failures` (shown in the app's "Unapplied diffs" view) instead of silently dropped.
+3. **`applyDiff(current, bodies)`** converts the pseudo-diff into a real unified-diff patch and applies it via the vendored jsdiff engine (`vendor/diff.min.js`), rather than hand-rolling the splice:
+   - **`splitClusters(diffLines)`** breaks the flat diff into independent edit clusters (leading context + ops + trailing context), forcing a boundary wherever context follows an op and more ops appear after (a fresh edit site), or at an `"..."`/`"…"` omission marker.
+   - **`buildHunk(current, cluster, cursorHint)`** anchors one cluster against `current` and expands it into a self-contained hunk. A cluster's anchor line alone (often just `"}"` or a blank line) is rarely globally unique, and because the forward search has no upper bound, a wrong starting candidate will often still "succeed" by backfilling a lot of unrelated content on its way to the same later match a correct candidate would reach directly — so `buildHunk` tries every occurrence, walks the whole cluster forward from each (see `walkClusterFrom`/`findForward`), and requires the candidate with the smallest resulting span to be the unique minimum. `cursorHint` (the previous cluster's `trailingStart`) is tried first, since most clusters are the next sequential edit in the same narrative — this reproduces single-cursor continuation for the common case and only falls back to the full-file search for genuinely out-of-order clusters.
+   - **`buildPatchText(current, diffLines)`** builds all of a diff's hunks this way, then merges any that overlap (adjacent clusters share their boundary context by construction, and a cluster's trailing can legitimately run for a while and swallow another cluster's whole span) by unioning their `[oldStart, oldEnd)` intervals and sparse edit maps, and serializes the result into a real `@@ -oldStart,oldCount +newStart,newCount @@` patch.
+   - The assembled patch is handed to `Diff.applyPatch` (jsdiff). jsdiff itself is used purely as the line-splice engine on hunks whose anchors were already independently verified — it is never trusted to search for or disambiguate a hunk's position itself (it doesn't detect ambiguous context; it will silently pick a plausible-but-wrong location if asked to).
+4. Diffs that still fail to apply (0 or >1 anchor candidates, or a genuinely pure-add hunk with no anchor at all) are recorded in `failures` (shown in the app's "Unapplied diffs" view) instead of silently dropped or guessed.
 5. Files are matched across messages primarily by path, with a `byBase`/`canonicalFor` fallback that resolves diffs referencing only a basename to the single matching known file (fails safe — ambiguous basenames are left unresolved).
 
-When editing diff-matching logic, the strict→loose→runs fallback order and the "fail rather than guess wrong" posture (leaving unresolved diffs visible with a reason) are intentional — don't make failure silent.
+When editing diff-matching logic, the "fail rather than guess wrong" posture (leaving unresolved diffs visible with a reason instead of silently mis-applying) is intentional and load-bearing — a prior version of this resolver had bugs that looked like successes but silently corrupted reconstructed files (e.g. new code landing above a file's `import` line). Any change here should be checked against a real exported conversation, not just unit-style snippets: verify `stats.diffApplied` doesn't regress, and spot-check reconstructed files for structural sanity (e.g. brace balance for curly-brace languages).
 
 ### `app.js` — UI layer
 
