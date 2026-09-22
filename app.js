@@ -27,41 +27,8 @@
     return d.toLocaleString();
   }
 
-  function extractRaw(msg) {
-    var sender = msg.sender || "unknown";
-    var blocks = Array.isArray(msg.content) ? msg.content : [];
-    if (sender === "assistant") {
-      // Text parts only: ignore thinking / tool_use / tool_result.
-      return blocks
-        .filter(function (b) { return b && b.type === "text" && typeof b.text === "string"; })
-        .map(function (b) { return b.text; })
-        .join("\n\n")
-        .trim();
-    }
-    if (typeof msg.text === "string" && msg.text.trim()) return msg.text.trim();
-    return blocks
-      .filter(function (b) { return b && typeof b.text === "string"; })
-      .map(function (b) { return b.text; })
-      .join("\n\n")
-      .trim();
-  }
-
   function parseData(data, label) {
-    if (!data || !Array.isArray(data.chat_messages)) {
-      throw new Error("Not a conversation export: missing chat_messages array.");
-    }
-    var msgs = data.chat_messages.map(function (m) {
-      return {
-        uuid: m.uuid || "",
-        sender: m.sender === "human" ? "human" : "assistant",
-        created: m.created_at || "",
-        raw: extractRaw(m)
-      };
-    }).filter(function (m) { return m.raw.length > 0; });
-
-    msgs.sort(function (a, b) {
-      return new Date(a.created).getTime() - new Date(b.created).getTime();
-    });
+    var msgs = window.ConversationResolve.extractMessages(data);
 
     // Reconstruct full files from diffs: each assistant diff block is replaced
     // by the complete file as of that message. Unresolvable diffs keep their

@@ -16,9 +16,13 @@ There is no build/lint/test tooling (no `package.json`). To run the app locally:
 npx serve .          # or: python3 -m http.server
 ```
 
-Then open the served URL. `resolve.js` also exports its API via `module.exports` when run under Node (`require('./resolve.js')`), which is useful for exercising the resolver logic directly in a Node REPL without a browser — but there is no existing test harness/script for this.
+Then open the served URL. `resolve.js` also exports its API via `module.exports` when run under Node (`require('./resolve.js')`), which is useful for exercising the resolver logic directly in a Node REPL without a browser.
 
 Note: opening `index.html` directly via `file://` will NOT auto-load conversation JSON, since browsers block `fetch()` on `file://`. Use a local server, or drag-and-drop / "Choose JSON" instead.
+
+### `reconstruct.js` — headless CLI
+
+`node reconstruct.js <conversation.json> [--out <dir>] [--zip]` runs the exact same resolution pipeline as the browser (`resolve.js`'s `extractMessages` + `resolveAll`) without opening a UI. Writes every reconstructed file under `--out` (default `out/`), plus one `<path>.<n>.rej` file per unresolved diff (original pseudo-diff + failure reason, à la `patch --reject`) and an `UNRESOLVED.md` manifest. `--zip` bundles the same output into `<out>/reconstructed.zip` via the vendored JSZip instead of writing loose files. Exits non-zero if any diff failed to apply, so it's CI/script-friendly.
 
 ## Architecture
 
@@ -44,7 +48,7 @@ When editing diff-matching logic, the "fail rather than guess wrong" posture (le
 ### `app.js` — UI layer
 
 Single IIFE, plain DOM manipulation (no framework). Key responsibilities:
-- `parseData` — validates/sorts `chat_messages`, calls `ConversationResolve.resolveAll`, and drives all downstream rendering/state (`state` object at the top of the file).
+- `parseData` — calls `ConversationResolve.extractMessages` (shared with `reconstruct.js`) to validate/sort `chat_messages`, then `ConversationResolve.resolveAll`, and drives all downstream rendering/state (`state` object at the top of the file).
 - `render()` — renders the timeline of messages (respecting sender filter + search query), decorates code blocks (`decorateCodeBlocks`) with collapse/expand, language, line count, and a status badge (`original` / `reconstructed` / `unresolved`).
 - `attachDiffToggles` — lets a user flip a reconstructed code block between the rebuilt full file and the original raw diff, matched positionally against `originalDiffs` produced by `resolve.js`.
 - `renderDiffs()` — the "Unapplied diffs" view, listing `state.failures` with reasons.

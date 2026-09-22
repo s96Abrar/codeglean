@@ -468,6 +468,47 @@
     return events;
   }
 
+  function extractRaw(msg) {
+    var sender = msg.sender || "unknown";
+    var blocks = Array.isArray(msg.content) ? msg.content : [];
+    if (sender === "assistant") {
+      // Text parts only: ignore thinking / tool_use / tool_result.
+      return blocks
+        .filter(function (b) { return b && b.type === "text" && typeof b.text === "string"; })
+        .map(function (b) { return b.text; })
+        .join("\n\n")
+        .trim();
+    }
+    if (typeof msg.text === "string" && msg.text.trim()) return msg.text.trim();
+    return blocks
+      .filter(function (b) { return b && typeof b.text === "string"; })
+      .map(function (b) { return b.text; })
+      .join("\n\n")
+      .trim();
+  }
+
+  // Parse+sort a raw conversation export into the [{uuid, sender, created,
+  // raw}] list resolveAll expects. Shared by the browser UI (app.js) and the
+  // Node CLI (reconstruct.js) so there is exactly one place that knows the
+  // export's shape.
+  function extractMessages(data) {
+    if (!data || !Array.isArray(data.chat_messages)) {
+      throw new Error("Not a conversation export: missing chat_messages array.");
+    }
+    var msgs = data.chat_messages.map(function (m) {
+      return {
+        uuid: m.uuid || "",
+        sender: m.sender === "human" ? "human" : "assistant",
+        created: m.created_at || "",
+        raw: extractRaw(m)
+      };
+    }).filter(function (m) { return m.raw.length > 0; });
+    msgs.sort(function (a, b) {
+      return new Date(a.created).getTime() - new Date(b.created).getTime();
+    });
+    return msgs;
+  }
+
   // Resolve display markdown for a sorted [{uuid, sender, created, raw}] list.
   function resolveAll(msgs) {
     var states = {}; // canonical path -> {lines, lang, revs, updatedAt, display}
@@ -606,6 +647,7 @@
     applyDiff: applyDiff,
     normPath: normPath,
     inferLang: inferLang,
+    extractMessages: extractMessages,
     resolveAll: resolveAll
   };
   if (typeof module !== "undefined" && module.exports) {
