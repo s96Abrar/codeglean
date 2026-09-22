@@ -49,6 +49,25 @@ No build step, no install:
 
 > Browsers block `fetch()` on `file://`, so opening `index.html` directly won't auto-load the sample — use a local server or drag & drop instead.
 
+## Command-line (no browser)
+
+Prefer a script over a UI, or want this in CI? `reconstruct.js` runs the exact same resolution pipeline headlessly under Node:
+
+```bash
+node reconstruct.js Conversation.json --out recovered      # writes every file under recovered/
+node reconstruct.js Conversation.json --out recovered --zip # ...or bundles them into recovered/reconstructed.zip
+```
+
+Either way you also get one `<path>.<n>.rej` file per diff that couldn't be applied (original pseudo-diff + reason, à la `patch --reject`) and an `UNRESOLVED.md` manifest. Exits non-zero if anything failed to apply, so it's safe to gate on in a script.
+
+For debugging a single file's reconstruction step by step:
+
+```bash
+node reconstruct.js Conversation.json --trace AppDelegate.swift --out trace
+```
+
+Writes that file's whole history: the initial full file, then one real `git diff`-style unified patch per message that touches it (`AppDelegate.swift.<message_order>.<message_id>`), then the final state as `AppDelegate.swift.final`.
+
 ## Expected JSON format
 
 ```jsonc
@@ -93,6 +112,7 @@ All paths are relative, so project-site subpaths work out of the box. On load th
 | `style.css` | Dark theme, GPU-light (no blur, no animations) |
 | `app.js` | Parsing, rendering, search, filters, downloads |
 | `resolve.js` | Chronological diff replay → full-file reconstruction |
+| `reconstruct.js` | Headless Node CLI wrapping the same pipeline (`--zip`, `--trace`) |
 | `icon.svg` | Project icon (also used as favicon) |
 | `sample-conversation.json` | Tiny demo conversation, loaded when no export is present |
 | `docs/screenshot.png` | Screenshot placeholder — replace with a real capture |
